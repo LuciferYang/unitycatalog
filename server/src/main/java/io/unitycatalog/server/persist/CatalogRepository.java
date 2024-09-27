@@ -9,6 +9,7 @@ import io.unitycatalog.server.persist.utils.HibernateUtils;
 import io.unitycatalog.server.persist.utils.PagedListingHelper;
 import io.unitycatalog.server.persist.utils.RepositoryUtils;
 import io.unitycatalog.server.utils.Constants;
+import io.unitycatalog.server.utils.IdentityUtils;
 import io.unitycatalog.server.utils.ValidationUtils;
 import java.util.ArrayList;
 import java.util.Date;
@@ -37,12 +38,18 @@ public class CatalogRepository {
 
   public CatalogInfo addCatalog(CreateCatalog createCatalog) {
     ValidationUtils.validateSqlObjectName(createCatalog.getName());
+    String callerId = IdentityUtils.findPrincipalEmailAddress();
+    Long createTime = System.currentTimeMillis();
     CatalogInfo catalogInfo =
         new CatalogInfo()
             .id(java.util.UUID.randomUUID().toString())
             .comment(createCatalog.getComment())
             .name(createCatalog.getName())
-            .createdAt(System.currentTimeMillis())
+            .owner(callerId)
+            .createdAt(createTime)
+            .createdBy(callerId)
+            .updatedAt(createTime)
+            .updatedBy(callerId)
             .properties(createCatalog.getProperties());
 
     try (Session session = SESSION_FACTORY.openSession()) {
@@ -136,7 +143,8 @@ public class CatalogRepository {
     if (updateCatalog.getNewName() != null) {
       ValidationUtils.validateSqlObjectName(updateCatalog.getNewName());
     }
-    // cna make this just update once we have an identifier that is not the name
+    String callerId = IdentityUtils.findPrincipalEmailAddress();
+    // can make this just update once we have an identifier that is not the name
     try (Session session = SESSION_FACTORY.openSession()) {
       Transaction tx = session.beginTransaction();
       try {
@@ -144,9 +152,13 @@ public class CatalogRepository {
         if (catalogInfoDAO == null) {
           throw new BaseException(ErrorCode.NOT_FOUND, "Catalog not found: " + name);
         }
-        if (updateCatalog.getNewName() == null && updateCatalog.getComment() == null) {
+        if (updateCatalog.getNewName() == null
+            && updateCatalog.getComment() == null
+            && (updateCatalog.getProperties() == null || updateCatalog.getProperties().isEmpty())) {
           tx.rollback();
-          return catalogInfoDAO.toCatalogInfo();
+          CatalogInfo catalogInfo = catalogInfoDAO.toCatalogInfo();
+          return RepositoryUtils.attachProperties(
+              catalogInfo, catalogInfo.getId(), Constants.CATALOG, session);
         }
         if (updateCatalog.getNewName() != null
             && getCatalogDAO(session, updateCatalog.getNewName()) != null) {
@@ -159,10 +171,20 @@ public class CatalogRepository {
         if (updateCatalog.getComment() != null) {
           catalogInfoDAO.setComment(updateCatalog.getComment());
         }
+        if (updateCatalog.getProperties() != null && !updateCatalog.getProperties().isEmpty()) {
+          PropertyRepository.findProperties(session, catalogInfoDAO.getId(), Constants.CATALOG)
+              .forEach(session::remove);
+          session.flush();
+          PropertyDAO.from(updateCatalog.getProperties(), catalogInfoDAO.getId(), Constants.CATALOG)
+              .forEach(session::persist);
+        }
         catalogInfoDAO.setUpdatedAt(new Date());
+        catalogInfoDAO.setUpdatedBy(callerId);
         session.merge(catalogInfoDAO);
         tx.commit();
-        return catalogInfoDAO.toCatalogInfo();
+        CatalogInfo catalogInfo = catalogInfoDAO.toCatalogInfo();
+        return RepositoryUtils.attachProperties(
+            catalogInfo, catalogInfo.getId(), Constants.CATALOG, session);
       } catch (Exception e) {
         tx.rollback();
         throw e;

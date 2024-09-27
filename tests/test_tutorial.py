@@ -10,6 +10,14 @@ import requests
 import duckdb
 
 commands_and_expected_output_strings = [
+    # server version
+    ("bin/start-uc-server -v", ["0."]),
+    ("bin/start-uc-server --version", ["0."]),
+
+    # cli version
+    ("bin/uc -v", ["0."]),
+    ("bin/uc --version", ["0."]),
+
     # catalogs
     ("bin/uc catalog list", ["unity"]),
 
@@ -102,7 +110,7 @@ def start_server():
         time.sleep(60)
         i = 0
         success = False
-        while i < 30 and not success:
+        while i < 60 and not success:
             try:
                 response = requests.head("http://localhost:8081", timeout=60)
                 if response.status_code == 200:
@@ -110,14 +118,14 @@ def start_server():
                     success = True
                 else:
                     print(f"Waiting... Server responded with status code: {response.status_code}")
-                    time.sleep(1)
+                    time.sleep(2)
                     i += 1
             except requests.RequestException as e:
                 print(f"Waiting... Failed to connect to the server: {e}")
-                time.sleep(1)
+                time.sleep(2)
                 i += 1
 
-        if i >= 30:
+        if i >= 60:
             with open(log_file, 'r') as lf:
                 print(f">> Server is taking too long to get ready, failing tests. Log:\n{lf.read()}")
             exit(1)

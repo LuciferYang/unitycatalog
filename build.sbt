@@ -3,13 +3,21 @@ import java.io.File
 import Tarball.createTarballSettings
 import sbt.util
 import sbtlicensereport.license.{DepModuleInfo, LicenseCategory, LicenseInfo}
-import ReleaseSettings.{javaOnlyReleaseSettings, rootReleaseSettings, skipReleaseSettings}
+import ReleaseSettings.*
 
-import scala.jdk.CollectionConverters.asJavaIterableConverter
 import scala.language.implicitConversions
 
 val orgName = "io.unitycatalog"
 val artifactNamePrefix = "unitycatalog"
+
+// Use Java 11 for two modules: clients and spark
+// for better Spark compatibility
+// until Spark 4 comes out with newer Java compatibility
+lazy val javacRelease11 = Seq("--release", "11")
+lazy val javacRelease17 = Seq("--release", "17")
+
+lazy val scala212 = "2.12.15"
+lazy val scala213 = "2.13.14"
 
 lazy val commonSettings = Seq(
   organization := orgName,
@@ -24,9 +32,10 @@ lazy val commonSettings = Seq(
   Compile / compile / javacOptions ++= Seq(
     "-Xlint:deprecation",
     "-Xlint:unchecked",
-    "-source", "17",
-    "-target", "17",
     "-g:source,lines,vars",
+  ),
+  Test / javaOptions ++= Seq (
+    "-ea",
   ),
   libraryDependencies ++= Seq(
     "org.slf4j" % "slf4j-api" % "2.0.13",
@@ -42,7 +51,7 @@ lazy val commonSettings = Seq(
   crossPaths := false,  // No scala cross building
   assembly / assemblyMergeStrategy := {
     case PathList("META-INF", xs @ _*) => MergeStrategy.discard
-    case x => MergeStrategy.first
+    case _ => MergeStrategy.first
   },
 
   // Test configs
@@ -73,12 +82,18 @@ lazy val commonSettings = Seq(
     // https://en.wikipedia.org/wiki/GNU_Lesser_General_Public_License
     // We can use and distribute the, but not modify the source code
     case DepModuleInfo("org.hibernate.orm", _, _) => true
+    case DepModuleInfo("com.unboundid.scim2", _, _) => true
+    case DepModuleInfo("com.unboundid.product.scim2", _, _) => true
+    case DepModuleInfo("com.googlecode.aviator", _, _) => true
     // Duo license:
     //  - Eclipse Public License 2.0
     //  - GNU General Public License, version 2 with the GNU Classpath Exception
     // I think we're good with the classpath exception in there.
     case DepModuleInfo("jakarta.transaction", "jakarta.transaction-api", _) => true
+    case DepModuleInfo("javax.annotation", "javax.annotation-api", _) => true
   },
+  
+  assembly / test := {}
 )
 
 enablePlugins(CoursierPlugin)
@@ -103,6 +118,48 @@ def javafmtCheckSettings() = Seq(
   (Compile / compile) := ((Compile / compile) dependsOn (Compile / javafmtCheckAll)).value
 )
 
+lazy val controlApi = (project in file("target/control/java"))
+  .enablePlugins(OpenApiGeneratorPlugin)
+  .disablePlugins(JavaFormatterPlugin)
+  .settings(
+    name := s"$artifactNamePrefix-controlapi",
+    commonSettings,
+    skipReleaseSettings,
+    libraryDependencies ++= Seq(
+      "jakarta.annotation" % "jakarta.annotation-api" % "3.0.0" % Provided,
+      "com.fasterxml.jackson.core" % "jackson-annotations" % jacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-databind" % jacksonVersion,
+      "com.fasterxml.jackson.datatype" % "jackson-datatype-jsr310" % jacksonVersion,
+    ),
+    (Compile / compile) := ((Compile / compile) dependsOn generate).value,
+
+    // OpenAPI generation specs
+    openApiInputSpec := (file(".") / "api" / "control.yaml").toString,
+    openApiGeneratorName := "java",
+    openApiOutputDir := (file("target") / "control" / "java").toString,
+    openApiApiPackage := s"$orgName.control.api",
+    openApiModelPackage := s"$orgName.control.model",
+    openApiAdditionalProperties := Map(
+      "library" -> "native",
+      "useJakartaEe" -> "true",
+      "hideGenerationTimestamp" -> "true",
+      "openApiNullable" -> "false"),
+    openApiGenerateApiTests := SettingDisabled,
+    openApiGenerateModelTests := SettingDisabled,
+    openApiGenerateApiDocumentation := SettingDisabled,
+    openApiGenerateModelDocumentation := SettingDisabled,
+    // Define the simple generate command to generate full client codes
+    generate := {
+      val _ = openApiGenerate.value
+
+      // Delete the generated build.sbt file so that it is not used for our sbt config
+      val buildSbtFile = file(openApiOutputDir.value) / "build.sbt"
+      if (buildSbtFile.exists()) {
+        buildSbtFile.delete()
+      }
+    }
+  )
+
 lazy val client = (project in file("target/clients/java"))
   .enablePlugins(OpenApiGeneratorPlugin)
   .disablePlugins(JavaFormatterPlugin)
@@ -110,6 +167,7 @@ lazy val client = (project in file("target/clients/java"))
     name := s"$artifactNamePrefix-client",
     commonSettings,
     javaOnlyReleaseSettings,
+    Compile / compile / javacOptions ++= javacRelease11,
     libraryDependencies ++= Seq(
       "com.fasterxml.jackson.core" % "jackson-annotations" % jacksonVersion,
       "com.fasterxml.jackson.core" % "jackson-core" % jacksonVersion,
@@ -135,7 +193,8 @@ lazy val client = (project in file("target/clients/java"))
     openApiAdditionalProperties := Map(
       "library" -> "native",
       "useJakartaEe" -> "true",
-      "hideGenerationTimestamp" -> "true"),
+      "hideGenerationTimestamp" -> "true",
+      "openApiNullable" -> "false"),
     openApiGenerateApiTests := SettingDisabled,
     openApiGenerateModelTests := SettingDisabled,
     openApiGenerateApiDocumentation := SettingDisabled,
@@ -149,6 +208,18 @@ lazy val client = (project in file("target/clients/java"))
       if (buildSbtFile.exists()) {
         buildSbtFile.delete()
       }
+    },
+    // Add VersionInfo in the same way like in server
+    Compile / sourceGenerators += Def.task {
+      val file = (Compile / sourceManaged).value / "io" / "unitycatalog" / "cli" / "utils" / "VersionUtils.java"
+      IO.write(file,
+        s"""package io.unitycatalog.cli.utils;
+          |
+          |public class VersionUtils {
+          |  public static String VERSION = "${version.value}";
+          |}
+          |""".stripMargin)
+      Seq(file)
     }
   )
 
@@ -156,7 +227,7 @@ lazy val apiDocs = (project in file("api"))
   .enablePlugins(OpenApiGeneratorPlugin)
   .settings(
     name := s"$artifactNamePrefix-docs",
-
+    skipReleaseSettings,
     // OpenAPI generation specs
     openApiInputSpec := (file("api") / "all.yaml").toString,
     openApiGeneratorName := "markdown",
@@ -175,10 +246,15 @@ lazy val server = (project in file("server"))
   .dependsOn(serverModels)
   .settings (
     name := s"$artifactNamePrefix-server",
+    mainClass := Some(orgName + ".server.UnityCatalogServer"),
     commonSettings,
     javaOnlyReleaseSettings,
     javafmtCheckSettings,
     javaCheckstyleSettings(file("dev") / "checkstyle-config.xml"),
+    Compile / compile / javacOptions ++= Seq(
+      "-processor",
+      "lombok.launch.AnnotationProcessorHider$AnnotationProcessor"
+    ) ++ javacRelease17,
     libraryDependencies ++= Seq(
       "com.linecorp.armeria" %  "armeria" % "1.28.4",
       // Netty dependencies
@@ -188,17 +264,25 @@ lazy val server = (project in file("server"))
       "com.fasterxml.jackson.core" % "jackson-annotations" % jacksonVersion,
       "com.fasterxml.jackson.core" % "jackson-core" % jacksonVersion,
       "com.fasterxml.jackson.core" % "jackson-databind" % jacksonVersion,
+      "com.fasterxml.jackson.dataformat" % "jackson-dataformat-yaml" % jacksonVersion,
       "com.fasterxml.jackson.datatype" % "jackson-datatype-jsr310" % jacksonVersion,
 
       "com.google.code.findbugs" % "jsr305" % "3.0.2",
       "com.h2database" %  "h2" % "2.2.224",
 
       "org.hibernate.orm" % "hibernate-core" % "6.5.0.Final",
-      "org.openapitools" % "jackson-databind-nullable" % openApiToolsJacksonBindNullableVersion,
 
       "jakarta.activation" % "jakarta.activation-api" % "2.1.3",
       "net.bytebuddy" % "byte-buddy" % "1.14.15",
       "org.projectlombok" % "lombok" % "1.18.32" % Provided,
+
+      // For ALDS access
+      "com.azure" % "azure-identity" % "1.13.2",
+      "com.azure" % "azure-storage-file-datalake" % "12.20.0",
+
+      // For GCS Access
+      "com.google.cloud" % "google-cloud-storage" % "2.30.1",
+      "com.google.auth" % "google-auth-library-oauth2-http" % "1.20.0",
 
       //For s3 access
       "com.amazonaws" % "aws-java-sdk-s3" % "1.12.728",
@@ -208,10 +292,23 @@ lazy val server = (project in file("server"))
       // Iceberg REST Catalog dependencies
       "org.apache.iceberg" % "iceberg-core" % "1.5.2",
       "org.apache.iceberg" % "iceberg-aws" % "1.5.2",
+      "org.apache.iceberg" % "iceberg-azure" % "1.5.2",
+      "org.apache.iceberg" % "iceberg-gcp" % "1.5.2",
       "software.amazon.awssdk" % "s3" % "2.24.0",
+      "software.amazon.awssdk" % "sts" % "2.24.0",
       "io.vertx" % "vertx-core" % "4.3.5",
       "io.vertx" % "vertx-web" % "4.3.5",
       "io.vertx" % "vertx-web-client" % "4.3.5",
+
+      // Auth dependencies
+      "com.unboundid.product.scim2" % "scim2-sdk-common" % "3.1.0",
+      "org.casbin" % "jcasbin" % "1.55.0",
+      "org.casbin" % "jdbc-adapter" % "2.7.0"
+        exclude("com.microsoft.sqlserver", "mssql-jdbc")
+        exclude("com.oracle.database.jdbc", "ojdbc6"),
+      "org.springframework" % "spring-expression" % "6.1.11",
+      "com.auth0" % "java-jwt" % "4.4.0",
+      "com.auth0" % "jwks-rsa" % "0.22.1",
 
       // Test dependencies
       "org.junit.jupiter" %  "junit-jupiter" % "5.10.3" % Test,
@@ -226,11 +323,6 @@ lazy val server = (project in file("server"))
 
       // CLI dependencies
       "commons-cli" % "commons-cli" % "1.7.0"
-    ),
-
-    Compile / compile / javacOptions ++= Seq(
-      "-processor",
-      "lombok.launch.AnnotationProcessorHider$AnnotationProcessor"
     ),
 
     Compile / sourceGenerators += Def.task {
@@ -254,10 +346,13 @@ lazy val server = (project in file("server"))
 lazy val serverModels = (project in file("server") / "target" / "models")
   .enablePlugins(OpenApiGeneratorPlugin)
   .disablePlugins(JavaFormatterPlugin)
+  .dependsOn(controlModels % "compile->compile")
   .settings(
     name := s"$artifactNamePrefix-servermodels",
     commonSettings,
+    skipReleaseSettings,
     (Compile / compile) := ((Compile / compile) dependsOn generate).value,
+    Compile / compile / javacOptions ++= javacRelease17,
     libraryDependencies ++= Seq(
       "jakarta.annotation" % "jakarta.annotation-api" % "3.0.0" % Provided,
       "com.fasterxml.jackson.core" % "jackson-annotations" % jacksonVersion,
@@ -285,9 +380,46 @@ lazy val serverModels = (project in file("server") / "target" / "models")
     }
   )
 
+lazy val controlModels = (project in file("server") / "target" / "controlmodels")
+  .enablePlugins(OpenApiGeneratorPlugin)
+  .disablePlugins(JavaFormatterPlugin)
+  .settings(
+    name := s"$artifactNamePrefix-controlmodels",
+    commonSettings,
+    skipReleaseSettings,
+    (Compile / compile) := ((Compile / compile) dependsOn generate).value,
+    Compile / compile / javacOptions ++= javacRelease17,
+    libraryDependencies ++= Seq(
+      "jakarta.annotation" % "jakarta.annotation-api" % "3.0.0" % Provided,
+      "com.fasterxml.jackson.core" % "jackson-annotations" % jacksonVersion,
+    ),
+    // OpenAPI generation configs for generating model codes from the spec
+    openApiInputSpec := (file(".") / "api" / "control.yaml").toString,
+    openApiGeneratorName := "java",
+    openApiOutputDir := (file("server") / "target" / "controlmodels").toString,
+    openApiValidateSpec := SettingEnabled,
+    openApiGenerateMetadata := SettingDisabled,
+    openApiModelPackage := s"$orgName.control.model",
+    openApiAdditionalProperties := Map(
+      "library" -> "resteasy", // resteasy generates the most minimal models
+      "useJakartaEe" -> "true",
+      "hideGenerationTimestamp" -> "true"
+    ),
+    openApiGlobalProperties := Map("models" -> ""),
+    openApiGenerateApiTests := SettingDisabled,
+    openApiGenerateModelTests := SettingDisabled,
+    openApiGenerateApiDocumentation := SettingDisabled,
+    openApiGenerateModelDocumentation := SettingDisabled,
+    // Define the simple generate command to generate model codes
+    generate := {
+      val _ = openApiGenerate.value
+    }
+  )
+
 lazy val cli = (project in file("examples") / "cli")
-  .dependsOn(server % "compile->compile;test->test")
+  .dependsOn(server % "test->test")
   .dependsOn(client % "compile->compile;test->test")
+  .dependsOn(controlApi % "compile->compile")
   .settings(
     name := s"$artifactNamePrefix-cli",
     mainClass := Some(orgName + ".cli.UnityCatalogCli"),
@@ -295,6 +427,7 @@ lazy val cli = (project in file("examples") / "cli")
     skipReleaseSettings,
     javafmtCheckSettings,
     javaCheckstyleSettings(file("dev") / "checkstyle-config.xml"),
+    Compile / compile / javacOptions ++= javacRelease17,
     libraryDependencies ++= Seq(
       "commons-cli" % "commons-cli" % "1.7.0",
       "org.json" % "json" % "20240303",
@@ -321,29 +454,82 @@ lazy val cli = (project in file("examples") / "cli")
     Test / javaOptions += s"-Duser.dir=${(ThisBuild / baseDirectory).value.getAbsolutePath}",
   )
 
+/*
+  * This project is a combination of the server and client projects, shaded into a single JAR.
+  * It also includes the test classes from the server project.
+  * It is used for the Spark connector project(the client is required as a compile dependency,
+  * and the server(with tests) is required as a test dependency)
+  * This was necessary because Spark 3.5 has a dependency on Jackson 2.15, which conflicts with the Jackson 2.17
+ */
+lazy val serverShaded = (project in file("server-shaded"))
+  .dependsOn(server % "compile->compile, test->compile")
+  .settings(
+    name := s"$artifactNamePrefix-server-shaded",
+    commonSettings,
+    skipReleaseSettings,
+    Compile / packageBin := assembly.value,
+    assembly / mainClass := Some("io.unitycatalog.server.UnityCatalogServer"),
+    assembly / logLevel := Level.Warn,
+    assembly / test := {},
+    assembly / assemblyShadeRules := Seq(
+      ShadeRule.rename("com.fasterxml.**" -> "shaded.@0").inAll,
+      ShadeRule.rename("org.antlr.**" -> "shaded.@0").inAll,
+    ),
+    assemblyPackageScala / assembleArtifact := false,
+    assembly / fullClasspath := {
+      val compileClasspath = (server / Compile / fullClasspath).value
+      val testClasses = (server / Test / products).value
+      compileClasspath ++ testClasses.map(Attributed.blank)
+    }
+  )
+
+val sparkVersion = "3.5.3"
 lazy val spark = (project in file("connectors/spark"))
-  .dependsOn(client % "compile->compile;test->test")
-  .dependsOn(server % "test->test")
+  .dependsOn(client)
   .settings(
     name := s"$artifactNamePrefix-spark",
-    scalaVersion := "2.13.14",
+    scalaVersion := scala212,
+    crossScalaVersions := Seq(scala212, scala213),
     commonSettings,
+    scalaReleaseSettings,
     javaOptions ++= Seq(
       "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
     ),
-    javaCheckstyleSettings(file("dev") / "checkstyle-config.xml"),
+    javaCheckstyleSettings(file("dev/checkstyle-config.xml")),
+    Compile / compile / javacOptions ++= javacRelease11,
     libraryDependencies ++= Seq(
-      "org.apache.spark" %% "spark-sql" % "4.0.0-preview1",
+      "org.apache.spark" %% "spark-sql" % sparkVersion % Provided,
+      "com.fasterxml.jackson.core" % "jackson-databind" % "2.15.0",
+      "com.fasterxml.jackson.module" %% "jackson-module-scala" % "2.15.0",
+      "com.fasterxml.jackson.core" % "jackson-annotations" % "2.15.0",
+      "com.fasterxml.jackson.core" % "jackson-core" % "2.15.0",
+      "com.fasterxml.jackson.dataformat" % "jackson-dataformat-xml" % "2.15.0",
+      "org.antlr" % "antlr4-runtime" % "4.9.3",
+      "org.antlr" % "antlr4" % "4.9.3",
+      "com.google.cloud.bigdataoss" % "util-hadoop" % "3.0.2" % Provided,
+      "org.apache.hadoop" % "hadoop-azure" % "3.4.0" % Provided,
+    ),
+    libraryDependencies ++= Seq(
       // Test dependencies
       "org.junit.jupiter" % "junit-jupiter" % "5.10.3" % Test,
+      "org.assertj" % "assertj-core" % "3.26.3" % Test,
+      "org.mockito" % "mockito-core" % "5.11.0" % Test,
+      "org.mockito" % "mockito-inline" % "5.2.0" % Test,
+      "org.mockito" % "mockito-junit-jupiter" % "5.12.0" % Test,
       "net.aichler" % "jupiter-interface" % JupiterKeys.jupiterVersion.value % Test,
-      "io.delta" %% "delta-spark" % "4.0.0rc1" % Test,
+      "org.apache.hadoop" % "hadoop-client-runtime" % "3.4.0",
+      "io.delta" %% "delta-spark" % "3.2.1" % Test,
     ),
-    excludeDependencies ++= Seq(
-      // This is a transitive dependency from the `server` module and we have to exclude it here
-      // as it introduces some conflicts with the dependencies from Spark.
-      ExclusionRule("com.adobe.testing", "s3mock-junit5")
+    dependencyOverrides ++= Seq(
+      "com.fasterxml.jackson.core" % "jackson-databind" % "2.15.0",
+      "com.fasterxml.jackson.module" %% "jackson-module-scala" % "2.15.0",
+      "com.fasterxml.jackson.core" % "jackson-annotations" % "2.15.0",
+      "com.fasterxml.jackson.core" % "jackson-core" % "2.15.0",
+      "com.fasterxml.jackson.dataformat" % "jackson-dataformat-xml" % "2.15.0",
+      "org.antlr" % "antlr4-runtime" % "4.9.3",
+      "org.antlr" % "antlr4" % "4.9.3",
     ),
+    Test / unmanagedJars += (serverShaded / assembly).value,
     licenseDepExclusions := {
       case DepModuleInfo("org.hibernate.orm", _, _) => true
       case DepModuleInfo("jakarta.annotation", "jakarta.annotation-api", _) => true
@@ -361,11 +547,14 @@ lazy val spark = (project in file("connectors/spark"))
       case DepModuleInfo("ch.qos.logback", "logback-core", _) => true
       case DepModuleInfo("org.apache.xbean", "xbean-asm9-shaded", _) => true
       case DepModuleInfo("oro", "oro", _) => true
-    },
+      case DepModuleInfo("org.glassfish", "javax.json", _) => true
+      case DepModuleInfo("org.glassfish.hk2.external", "jakarta.inject", _) => true
+      case DepModuleInfo("org.antlr", "ST4", _) => true
+    }
   )
 
 lazy val root = (project in file("."))
-  .aggregate(serverModels, client, server, cli, spark)
+  .aggregate(serverModels, client, server, cli, spark, controlApi, controlModels, apiDocs)
   .settings(
     name := s"$artifactNamePrefix",
     createTarballSettings(),
